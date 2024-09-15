@@ -41,6 +41,12 @@ from litgpt.utils import (
     save_config,
     save_hyperparameters,
 )
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
+import functools
 
 
 def setup(
@@ -131,8 +137,20 @@ def setup(
         logger_name, out_dir, name=f"pretrain-{config.name}", resume=bool(resume), log_interval=train.log_interval
     )
 
+    my_auto_wrap_policy = {Block}
+    if train.fsdp_min_num_params is not None:
+        my_auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy, min_num_params=train.fsdp_min_num_params
+    )
     if devices * num_nodes > 1:
-        strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+        strategy = FSDPStrategy(
+            auto_wrap_policy=my_auto_wrap_policy,
+            state_dict_type="sharded",
+            #cluster_environment=MyClusterEnvironment(),
+            sharding_strategy="HYBRID_SHARD",
+            #device_mesh=(2, 4),
+            fsdp_size=train.fsdp_size,
+        )
     else:
         strategy = "auto"
 
@@ -216,8 +234,8 @@ def main(
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
-    if initial_checkpoint_dir:
-        fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
+    #if initial_checkpoint_dir:
+    #    fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
 
     state = {
         "model": model,
@@ -227,16 +245,16 @@ def main(
         "step_count": 0,
     }
 
-    resume = find_resume_path(resume, out_dir)
-    if resume:
-        fabric.print(f"Resuming training from {resume}")
-        fabric.load(resume, state)
+    #resume = find_resume_path(resume, out_dir)
+    #if resume:
+    #    fabric.print(f"Resuming training from {resume}")
+    #    fabric.load(resume, state)
 
     train_time = time.perf_counter()
     fit(fabric, devices, state, train_dataloader, val_dataloader, out_dir, tokenizer_dir, train, eval)
 
     # Save final checkpoint
-    save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
+    # save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
 
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
@@ -257,13 +275,13 @@ def fit(
     model = state["model"]
     optimizer = state["optimizer"]
 
-    if eval.initial_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-        val_loss = f"{val_loss:.3f}"
-    else:
-        fabric.print("Verifying settings ...")
-        validate(fabric, model, val_dataloader, max_iters=2, verbose=False)   # sanity check
-        val_loss = "n/a"
+    #if eval.initial_validation:
+    #    val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+    #    val_loss = f"{val_loss:.3f}"
+    #else:
+    #    fabric.print("Verifying settings ...")
+    #    validate(fabric, model, val_dataloader, max_iters=2, verbose=False)   # sanity check
+    #    val_loss = "n/a"
 
     throughput = ThroughputMonitor(fabric, window_size=5)
 
@@ -291,6 +309,24 @@ def fit(
 
     warmup_iters = train.warmup_iters(devices, max_iters, train_dataloader)
 
+    if torch.distributed.get_rank() == 0:
+        profiler = torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    schedule=torch.profiler.schedule(
+        wait=0,
+        warmup=5,
+        active=2,
+        repeat=1,
+    ),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler(out_dir/'profile'),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+    )
+        profiler.start()
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
@@ -319,6 +355,8 @@ def fit(
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
+            if torch.distributed.get_rank() == 0:
+                profiler.step()
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
@@ -343,6 +381,7 @@ def fit(
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
                 "learning_rate": lr,
             }
+            val_loss = 'n/a'
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
@@ -358,30 +397,35 @@ def fit(
             metrics.update(throughput_metrics)
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
 
-        if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
-            t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-            val_loss = val_loss.item()
-            td = time.perf_counter() - t0
+    if torch.distributed.get_rank() == 0:
+        profiler.stop()
 
-            fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
-            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-            fabric.log_dict(metrics, step=state["iter_num"] - 1)
-            fabric.barrier()
-
-        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
-            save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
-
+        #if val_dataloader is not None and not is_accumulating and state["step_count"] % eval.interval == 0:
+        #    t0 = time.perf_counter()
+        #    val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+        #    val_loss = val_loss.item()
+        #    td = time.perf_counter() - t0
+#
+        #    fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
+        #    metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+        #    fabric.log_dict(metrics, step=state["iter_num"] - 1)
+        #    fabric.barrier()
+#
+        #if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
+        #    save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
+#
     # Final validation
-    if eval.final_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-        fabric.log_dict(metrics, step=state["iter_num"])
-        fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+    #if eval.final_validation:
+    #    val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+    #    metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+    #    fabric.log_dict(metrics, step=state["iter_num"])
+    #    fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
 
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int, verbose: bool = True) -> torch.Tensor:
+    if len(val_dataloader) == 0:
+        return "n/a"
     fabric.barrier()
     if verbose:
         fabric.print("Validating ...")
@@ -397,7 +441,7 @@ def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max
         loss = chunked_cross_entropy(logits, targets)
         losses.append(loss)
 
-    val_loss = torch.stack(losses).mean()
+    val_loss = torch.stack(losses).mean() if losses else 0
     model.train()
     fabric.barrier()
     return val_loss

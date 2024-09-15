@@ -32,6 +32,10 @@ class TrainArgs:
     """Limits the length of samples"""
     tie_embeddings: Optional[bool] = None
     """Whether to tie the embedding weights with the language modeling head weights"""
+    fsdp_size: Optional[int] = None
+    """"FSDP group size."""
+    fsdp_min_num_params: Optional[int] = None
+     
 
     # Optimization args
     max_norm: Optional[float] = None
