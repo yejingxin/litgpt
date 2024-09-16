@@ -330,6 +330,7 @@ def fit(
     )
         profiler.start()
     for train_data in train_iterator:
+        fabric.print(f"{state["iter_num"]= } {max_iters=}")
         if state["iter_num"] >= max_iters:
             break
 
