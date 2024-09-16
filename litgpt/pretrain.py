@@ -156,16 +156,16 @@ def setup(
 
     fabric = L.Fabric(
         devices=devices,
-        num_nodes=num_nodes,
+        #num_nodes=num_nodes,
         strategy=strategy,
-        precision=precision,
+        #precision=precision,
         loggers=[logger]
     )
 
     if torch.cuda.is_available() and devices > 1:
         check_nvlink_connectivity(fabric)
 
-    fabric.launch()
+    #fabric.launch()
 
     fabric.print(pprint.pformat(hparams))
     if logger_name in ("tensorboard", "wandb"):
