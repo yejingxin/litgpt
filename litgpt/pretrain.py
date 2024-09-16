@@ -300,6 +300,7 @@ def fit(
     fabric.print(f"{max_tokens_per_device=} {tokens_per_iter=} {max_iters=}") 
     log_iter_interval = train.log_interval * train.gradient_accumulation_iters(devices)
     initial_iter = state["iter_num"]
+    fabric.print(f"{log_iter_interval=} {train.log_interval=} {devices=} {train.gradient_accumulation_iters(devices)=}")
     train_iterator = CycleIterator(train_dataloader)
 
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices), sync_on_compute=False).to(
