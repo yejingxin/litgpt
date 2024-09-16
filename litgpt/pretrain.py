@@ -232,7 +232,9 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
 
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
+    assert len(train_dataloader) > 0
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
+    assert len(train_dataloader) > 0
 
     #if initial_checkpoint_dir:
     #    fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
