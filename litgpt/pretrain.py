@@ -301,6 +301,7 @@ def fit(
     log_iter_interval = train.log_interval * train.gradient_accumulation_iters(fabric.world_size)
     initial_iter = state["iter_num"]
     fabric.print(f"{log_iter_interval=} {train.log_interval=} {devices=} {train.gradient_accumulation_iters(fabric.world_size)=}")
+    assert len(train_dataloader) > 0
     train_iterator = CycleIterator(train_dataloader)
 
     running_loss = RunningMean(window=train.gradient_accumulation_iters(fabric.world_size), sync_on_compute=False).to(
@@ -329,6 +330,7 @@ def fit(
     with_stack=True,
     )
         profiler.start()
+    #fabric.print(f"")
     for train_data in train_iterator:
         fabric.print(f"{state['iter_num']= } {max_iters=}")
         if state["iter_num"] >= max_iters:
