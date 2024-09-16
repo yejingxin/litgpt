@@ -524,3 +524,10 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
     if issues:
         raise ValueError("\n".join(issues))
+
+if __name__ == "__main__":
+    torch.set_float32_matmul_precision("high")
+
+    from jsonargparse import CLI
+
+    CLI(setup)
