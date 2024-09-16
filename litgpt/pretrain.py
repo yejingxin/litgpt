@@ -298,12 +298,12 @@ def fit(
     tokens_per_iter = train.micro_batch_size * model.max_seq_length
     max_iters = max_tokens_per_device // tokens_per_iter
     fabric.print(f"{max_tokens_per_device=} {tokens_per_iter=} {max_iters=}") 
-    log_iter_interval = train.log_interval * train.gradient_accumulation_iters(devices)
+    log_iter_interval = train.log_interval * train.gradient_accumulation_iters(fabric.world_size)
     initial_iter = state["iter_num"]
-    fabric.print(f"{log_iter_interval=} {train.log_interval=} {devices=} {train.gradient_accumulation_iters(devices)=}")
+    fabric.print(f"{log_iter_interval=} {train.log_interval=} {devices=} {train.gradient_accumulation_iters(fabric.world_size)=}")
     train_iterator = CycleIterator(train_dataloader)
 
-    running_loss = RunningMean(window=train.gradient_accumulation_iters(devices), sync_on_compute=False).to(
+    running_loss = RunningMean(window=train.gradient_accumulation_iters(fabric.world_size), sync_on_compute=False).to(
         fabric.device
     )
     fabric.barrier()
@@ -344,11 +344,11 @@ def fit(
         input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
         targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
-        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
+        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(fabric.world_size) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
             loss = chunked_cross_entropy(logits, targets)
-            fabric.backward(loss / train.gradient_accumulation_iters(devices))
+            fabric.backward(loss / train.gradient_accumulation_iters(fabric.world_size))
 
         running_loss.update(loss.detach())
 
