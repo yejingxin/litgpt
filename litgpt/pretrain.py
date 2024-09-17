@@ -59,7 +59,7 @@ def setup(
     precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
     initial_checkpoint_dir: Optional[Path] = None,
     resume: Union[bool, Literal["auto"], Path] = False,
-    train_data_path: Path = Path("training_data"),
+    train_data_path: Optional[Path] = None,
     #data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
         save_interval=1000,
@@ -236,7 +236,7 @@ def main(
     optimizer = instantiate_torch_optimizer(optimizer, model.parameters(), **extra_kwargs)
     optimizer = fabric.setup_optimizers(optimizer)
 
-    train_dataloader, val_dataloader = get_dataloaders(fabric, train_data_path, tokenizer, train, config.block_size)
+    train_dataloader, val_dataloader = get_dataloaders(fabric, train_data_path, tokenizer, train, config.block_size, config.vocab_size)
     #assert len(train_dataloader) > 0
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
     #assert len(train_dataloader) > 0
@@ -473,12 +473,28 @@ class Dataset(IterableDataset):
             x = torch.from_numpy((data[i : i + self.block_size]).astype(np.int64))
             y = torch.from_numpy((data[i + 1 : i + 1 + self.block_size]).astype(np.int64))
             yield x, y
+class FakeDataset(IterableDataset):
+    def __init__(self, vocab_size:int, block_size: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+
+    def __iter__(self):
+        while True:
+            data = torch.randint(self.vocab_size, (self.block_size+1,))
+            x = data[ : self.block_size]
+            y = data[1: ]
+            yield x, y
 
 def get_dataloaders(
-    fabric: L.Fabric, train_data_path: Path, tokenizer: Tokenizer, train: TrainArgs, block_size: int
+    fabric: L.Fabric, train_data_path: Path, tokenizer: Tokenizer, train: TrainArgs, block_size: int, vocab_size: int
 ) -> Tuple[DataLoader, DataLoader]:
-    train_data = Dataset(str(train_data_path / "train.bin"), block_size)
-    val_data = Dataset(str(train_data_path / "val.bin"), block_size)
+    if train_data_path is None:
+        train_data = FakeDataset(vocab_size, block_size)
+        val_data = FakeDataset(vocab_size, block_size)
+    else:
+        train_data = Dataset(str(train_data_path / "train.bin"), block_size)
+        val_data = Dataset(str(train_data_path / "val.bin"), block_size)
     train_dataloader = DataLoader(train_data, num_workers=2, batch_size=train.micro_batch_size)
     val_dataloader = DataLoader(val_data, num_workers=2, batch_size=train.micro_batch_size)
     return train_dataloader, val_dataloader
