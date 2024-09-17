@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Union, Dict
 import warnings
 
+import numpy as np
 import lightning as L
 import torch
 import torch.nn as nn
@@ -17,6 +18,8 @@ from lightning.fabric.utilities.throughput import ThroughputMonitor, measure_flo
 from torch.utils.data import DataLoader
 from torchmetrics.aggregation import RunningMean
 from typing_extensions import Literal
+
+from torch.utils.data import DataLoader, IterableDataset
 
 from litgpt import Tokenizer
 from litgpt.args import EvalArgs, TrainArgs
@@ -56,7 +59,8 @@ def setup(
     precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
     initial_checkpoint_dir: Optional[Path] = None,
     resume: Union[bool, Literal["auto"], Path] = False,
-    data: Optional[DataModule] = None,
+    train_data_path: Path = Path("training_data"),
+    #data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
         save_interval=1000,
         log_interval=1,
@@ -124,7 +128,7 @@ def setup(
             quit()
 
     hparams = capture_hparams()
-    data = TinyLlama() if data is None else data
+    #data = TinyLlama() if data is None else data
 
     config = Config.from_name(model_name) if model_config is None else model_config
     precision = precision or get_default_supported_precision(training=True)
@@ -178,7 +182,7 @@ def setup(
         initial_checkpoint_dir,
         resume,
         config,
-        data,
+        train_data_path,
         out_dir,
         tokenizer_dir,
         tokenizer,
@@ -195,7 +199,8 @@ def main(
     initial_checkpoint_dir: Optional[Path],
     resume: Union[bool, Literal["auto"], Path],
     config: Config,
-    data: DataModule,
+    train_data_path: Path,
+    #data: DataModule,
     out_dir: Path,
     tokenizer_dir: Optional[Path],
     tokenizer: Optional[Tokenizer],
@@ -231,10 +236,10 @@ def main(
     optimizer = instantiate_torch_optimizer(optimizer, model.parameters(), **extra_kwargs)
     optimizer = fabric.setup_optimizers(optimizer)
 
-    train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
-    assert len(train_dataloader) > 0
+    train_dataloader, val_dataloader = get_dataloaders(fabric, train_data_path, tokenizer, train, config.block_size)
+    #assert len(train_dataloader) > 0
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
-    assert len(train_dataloader) > 0
+    #assert len(train_dataloader) > 0
 
     #if initial_checkpoint_dir:
     #    fabric.load_raw(initial_checkpoint_dir / "lit_model.pth", model)
@@ -303,7 +308,7 @@ def fit(
     log_iter_interval = train.log_interval * train.gradient_accumulation_iters(fabric.world_size)
     initial_iter = state["iter_num"]
     fabric.print(f"{log_iter_interval=} {train.log_interval=} {devices=} {train.gradient_accumulation_iters(fabric.world_size)=}")
-    assert len(train_dataloader) > 0
+    #assert len(train_dataloader) > 0
     train_iterator = CycleIterator(train_dataloader)
 
     running_loss = RunningMean(window=train.gradient_accumulation_iters(fabric.world_size), sync_on_compute=False).to(
@@ -333,7 +338,7 @@ def fit(
     )
         profiler.start()
     #fabric.print(f"")
-    for train_data in train_iterator:
+    for input_ids, targets in train_iterator:
         fabric.print(f"{state['iter_num']= } {max_iters=}")
         if state["iter_num"] >= max_iters:
             fabric.print(f'Training reaches targeted num iters: {max_iters}')
@@ -347,8 +352,9 @@ def fit(
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
 
-        input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
-        targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
+         
+        #input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
+        #targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(fabric.world_size) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
@@ -432,8 +438,8 @@ def fit(
 
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int, verbose: bool = True) -> torch.Tensor:
-    if len(val_dataloader) == 0:
-        return "n/a"
+    #if len(val_dataloader) == 0:
+    #    return "n/a"
     fabric.barrier()
     if verbose:
         fabric.print("Validating ...")
@@ -454,16 +460,27 @@ def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max
     fabric.barrier()
     return val_loss
 
+class Dataset(IterableDataset):
+    def __init__(self, data_file: Path, block_size: int):
+        super().__init__()
+        self.data_file = data_file
+        self.block_size = block_size
+
+    def __iter__(self):
+        data = np.memmap(self.data_file, dtype=np.uint16, mode="r")
+        while True:
+            i = torch.randint(len(data) - self.block_size, (1,)).item()
+            x = torch.from_numpy((data[i : i + self.block_size]).astype(np.int64))
+            y = torch.from_numpy((data[i + 1 : i + 1 + self.block_size]).astype(np.int64))
+            yield x, y
 
 def get_dataloaders(
-    fabric: L.Fabric, data: DataModule, tokenizer: Tokenizer, train: TrainArgs, block_size: int
+    fabric: L.Fabric, train_data_path: Path, tokenizer: Tokenizer, train: TrainArgs, block_size: int
 ) -> Tuple[DataLoader, DataLoader]:
-    data.connect(tokenizer=tokenizer, batch_size=train.micro_batch_size, max_seq_length=block_size)
-    with fabric.rank_zero_first():
-        data.prepare_data()
-    data.setup()
-    train_dataloader = data.train_dataloader()
-    val_dataloader = data.val_dataloader()
+    train_data = Dataset(str(train_data_path / "train.bin"), block_size)
+    val_data = Dataset(str(train_data_path / "val.bin"), block_size)
+    train_dataloader = DataLoader(train_data, num_workers=2, batch_size=train.micro_batch_size)
+    val_dataloader = DataLoader(val_data, num_workers=2, batch_size=train.micro_batch_size)
     return train_dataloader, val_dataloader
 
 
