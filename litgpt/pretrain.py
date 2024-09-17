@@ -339,7 +339,6 @@ def fit(
         profiler.start()
     #fabric.print(f"")
     for input_ids, targets in train_iterator:
-        fabric.print(f"{state['iter_num']= } {max_iters=}")
         if state["iter_num"] >= max_iters:
             fabric.print(f'Training reaches targeted num iters: {max_iters}')
             break
